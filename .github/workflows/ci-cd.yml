@@ -1,0 +1,66 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '16'
+
+    - name: Install backend dependencies
+      run: |
+        cd backend
+        npm install
+
+    - name: Install frontend dependencies
+      run: |
+        cd frontend
+        npm install
+
+    - name: Build frontend
+      run: |
+        cd frontend
+        npm run build
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: eu-north-1
+
+    - name: Deploy to AWS
+      id: terraform
+      run: |
+        cd infrastructure
+        terraform init
+        terraform plan -var="db_password=${{ secrets.DB_PASSWORD }}" -var="docker_username=${{ secrets.DOCKER_USERNAME }}"
+        terraform apply -auto-approve -var="db_password=${{ secrets.DB_PASSWORD }}" -var="docker_username=${{ secrets.DOCKER_USERNAME }}"
+        echo "frontend_bucket=$(terraform output -raw frontend_bucket)" >> $GITHUB_OUTPUT
+        echo "cloudfront_id=$(terraform output -raw cloudfront_distribution_id)" >> $GITHUB_OUTPUT
+
+    - name: Build and push backend Docker image
+      run: |
+        cd backend
+        docker build -t cloudforge-backend:latest .
+        docker tag cloudforge-backend:latest ${{ secrets.DOCKER_USERNAME }}/cloudforge-backend:latest
+        echo ${{ secrets.DOCKER_PASSWORD }} | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+        docker push ${{ secrets.DOCKER_USERNAME }}/cloudforge-backend:latest
+
+    - name: Deploy frontend to S3
+      run: |
+        aws s3 sync frontend/build s3://${{ steps.terraform.outputs.frontend_bucket }} --delete
+        aws cloudfront create-invalidation --distribution-id ${{ steps.terraform.outputs.cloudfront_id }} --paths "/*"
